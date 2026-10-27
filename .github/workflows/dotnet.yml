@@ -5,24 +5,73 @@ name: .NET
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "**" ]  # every branch, every push
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "story/**" ]    # only PRs targeting main or story branches
+
+# Cancel an in-progress CI run for the same branch/PR when a new push arrives.
+# This keeps queues clean on rapid pushes without blocking CD.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_VERSION: "10.0.x"
 
 jobs:
-  build:
 
+# ── Version ────────────────────────────────────────────────────────────────────
+# Computes major.minor.patch from VERSION file + run number.
+# Exposed as a workflow output so CD can read it via the workflow_run context.
+  version:
+    name: Version
     runs-on: ubuntu-latest
+    outputs:
+      semver: ${{ steps.ver.outputs.semver }}
+      tag:    ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute version
+        id: ver
+        run: |
+          BASE=$(cat VERSION | tr -d '[:space:]')
+          SEMVER="${BASE}.${{ github.run_number }}"
+          echo "semver=${SEMVER}" >> $GITHUB_OUTPUT
+          echo "tag=v${SEMVER}"   >> $GITHUB_OUTPUT
+          echo "Version: ${SEMVER}"
+
+# ── Build & Test (.NET) ────────────────────────────────────────────────────────
+  build:
+    name: Build & Test (.NET)
+    runs-on: ubuntu-latest
+    needs: version
 
     steps:
     - uses: actions/checkout@v4
-    - name: Setup .NET
+  
+    - name: Setup .NET ${{ env.DOTNET_VERSION }}
       uses: actions/setup-dotnet@v4
       with:
-        dotnet-version: 8.0.x
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
     - name: Restore dependencies
       run: dotnet restore
+
     - name: Build
-      run: dotnet build --no-restore
+      run: >
+          dotnet build --no-restore --configuration Release
+          /p:Version=${{ needs.version.outputs.semver }}
+
     - name: Test
-      run: dotnet test --no-build --verbosity normal
+      run: >
+          dotnet test --no-build --configuration release
+          --verbosity normal
+          --results-directory ./test-results
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: dotnet-test-results
+        path: ./test-results/*.trx

@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="README.md" />
+    <File Path="Solution Items/Sequential Queue Specification 5.pdf" />
+  </Folder>
+  <Project Path="HoffmannQueue.Tests/HoffmannQueue.Tests.csproj" />
+  <Project Path="HoffmannQueue/HoffmannQueue.csproj" />
+</Solution>
