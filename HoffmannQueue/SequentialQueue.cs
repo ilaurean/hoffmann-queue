@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace HoffmannQueue;
 
 /// <summary>An entry of a <see cref="SequentialQueue{T}"/>: the sequence number and the stored object.</summary>
@@ -37,6 +39,7 @@ public sealed class SequentialQueue<T> :
 {
     private readonly int capacity;
     private long nextSequence;
+    private bool completed = false;
 
     private readonly Dictionary<long, T> items = [];
 
@@ -44,7 +47,7 @@ public sealed class SequentialQueue<T> :
 
     public int Count => items.Count;
 
-    public bool IsCompleted => IsCompleted && items.ContainsKey(nextSequence);
+    public bool IsCompleted => completed && items.ContainsKey(nextSequence);
 
     public long NextSequenceNumber => nextSequence;
 
@@ -57,34 +60,101 @@ public sealed class SequentialQueue<T> :
         nextSequence = firstSequenceNumber;
     }
 
-    public void CompleteAdding()
+    public async ValueTask EnqueueAsync(long sequenceNumber, T item, CancellationToken cancellationToken = default)
     {
-        throw new NotImplementedException();
-    }
+        ValidateSequenceItem(sequenceNumber, item);
+        cancellationToken.ThrowIfCancellationRequested();
 
-    public ValueTask<SequencedItem<T>> DequeueAsync(CancellationToken cancellationToken = default)
-    {
-        throw new NotImplementedException();
-    }
+        if (!TryEnqueue(sequenceNumber, item))
+        {
+            throw new InvalidOperationException($"Failed to enqueue item with sequence number {sequenceNumber}.");
+        }
 
-    public ValueTask EnqueueAsync(long sequenceNumber, T item, CancellationToken cancellationToken = default)
-    {
-        throw new NotImplementedException();
-    }
-
-    public IAsyncEnumerable<SequencedItem<T>> ReadAllAsync(CancellationToken cancellationToken = default)
-    {
-        throw new NotImplementedException();
-    }
-
-    public bool TryDequeue(out SequencedItem<T> item)
-    {
-        throw new NotImplementedException();
+        await ValueTask.CompletedTask;
     }
 
     public bool TryEnqueue(long sequenceNumber, T item)
     {
-        throw new NotImplementedException();
+        ObjectDisposedException.ThrowIf(disposedValue, this);
+        ValidateSequenceItem(sequenceNumber, item);
+
+        if (IsCompleted)
+        {
+            throw new SequentialQueueCompletedException();
+        }
+
+        if (sequenceNumber < nextSequence || items.ContainsKey(sequenceNumber))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(sequenceNumber),
+                sequenceNumber,
+                $"Sequence number {sequenceNumber} is/was already in the queue. Next expected sequence number is {nextSequence}.");
+        }
+
+        if (sequenceNumber >= nextSequence + capacity)
+        {
+            return false;
+        }
+
+        if (!items.TryAdd(sequenceNumber, item))
+        {
+            throw new InvalidOperationException($"Failed to add item with sequence number {sequenceNumber} to the queue.");
+        }
+        return true;
+    }
+
+    public async ValueTask<SequencedItem<T>> DequeueAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (!TryDequeue(out var item))
+        {
+            throw new InvalidOperationException($"Failed to dequeue item with sequence number {nextSequence}.");
+        }
+        return await ValueTask.FromResult(item);
+    }
+
+    public bool TryDequeue(out SequencedItem<T> item)
+    {
+        item = default;
+        ObjectDisposedException.ThrowIf(disposedValue, this);
+
+        if (items.Remove(nextSequence, out var value))
+        {
+            item = new SequencedItem<T>(nextSequence++, value);
+            return true;
+        }
+
+        return false;
+    }
+
+    public void CompleteAdding()
+    {
+        ObjectDisposedException.ThrowIf(disposedValue, this);
+        completed = true;
+    }
+
+    public async IAsyncEnumerable<SequencedItem<T>> ReadAllAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        while (true)
+        {
+            SequencedItem<T> item;
+            try
+            {
+                item = await DequeueAsync(cancellationToken);
+            }
+            catch (InvalidOperationException)
+            {
+                yield break;
+            }
+            yield return item;
+        }
+    }
+
+    private static void ValidateSequenceItem(long sequenceNumber, T item)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(sequenceNumber, 1L);
+        ArgumentNullException.ThrowIfNull(item);
     }
 
     #region IDisposable
