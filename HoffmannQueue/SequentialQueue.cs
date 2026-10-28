@@ -132,12 +132,8 @@ public sealed class SequentialQueue<T> :
         lock (lockObject)
         {
             ObjectDisposedException.ThrowIf(disposedValue, this);
-        }
 
-        lock (lockObject)
-        {
             item = default;
-
             if (items.Remove(nextSequence, out var value))
             {
                 item = new SequencedItem<T>(nextSequence++, value);
