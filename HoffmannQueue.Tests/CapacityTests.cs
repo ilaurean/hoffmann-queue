@@ -4,7 +4,7 @@ namespace HoffmannQueue.Tests;
 
 public class CapacityTests
 {
-    private static string Item(long seq) => $"Item-{seq}";
+    private static string Item(long seq) => $"Item-{seq:D5}";
 
     [Fact]
     public void Should_Succeed_When_TryingToDequeueAfterGapIsFilled()
@@ -33,7 +33,7 @@ public class CapacityTests
     }
 
     [Fact]
-    public void Should_Succeed_When_WindowSlidesAfterDequeue()
+    public void Should_Succeed_When_FillGapAfterDequeue()
     {
         using var queue = new SequentialQueue<string>(2);
         queue.TryEnqueue(1, Item(1)).Should().BeTrue();
@@ -77,7 +77,7 @@ public class CapacityTests
     }
 
     [Fact]
-    public void Should_Reject_When_WindowIsFull()
+    public void Should_Reject_When_QueueIsFull()
     {
         using var queue = new SequentialQueue<string>(3);
         queue.TryEnqueue(3, Item(3)).Should().BeTrue();
@@ -87,5 +87,17 @@ public class CapacityTests
 
         queue.TryEnqueue(4, Item(4)).Should().BeFalse();
         queue.Count.Should().BeLessThanOrEqualTo(queue.Capacity);
+    }
+
+    [Fact]
+    public void Should_Throw_When_EnqueueAndMarkedCompleted()
+    {
+        using var queue = new SequentialQueue<string>(16);
+        queue.TryEnqueue(1, Item(1)).Should().BeTrue();
+        queue.TryEnqueue(2, Item(2)).Should().BeTrue();
+        queue.TryEnqueue(3, Item(3)).Should().BeTrue();
+        queue.MarkAsComplete();
+        queue.IsCompleted.Should().BeTrue();
+        queue.Invoking(x => x.TryEnqueue(5, Item(5))).Should().Throw<SequentialQueueCompletedException>();
     }
 }

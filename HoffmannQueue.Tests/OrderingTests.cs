@@ -4,7 +4,7 @@ namespace HoffmannQueue.Tests;
 
 public class OrderingTests
 {
-    private static string Item(long seq) => $"Item-{seq}";
+    private static string Item(long seq) => $"Item-{seq:D5}";
 
     [Fact]
     public async Task Should_Succeed_When_InputIsInOrder()

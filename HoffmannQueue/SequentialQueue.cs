@@ -2,11 +2,13 @@ using System.Runtime.CompilerServices;
 
 namespace HoffmannQueue;
 
-/// <summary>An entry of a <see cref="SequentialQueue{T}"/>: the sequence number and the stored object.</summary>
+/// <summary>
+/// An entry of a <see cref="SequentialQueue{T}"/>: the sequence number and the stored object.
+/// </summary>
 public readonly record struct SequencedItem<T>(long SequenceNumber, T Item);
 
 /// <summary>
-/// Thrown when an operation cannot succeed because <see cref="SequentialQueue{T}.CompleteAdding"/> was called.
+/// Thrown when an operation cannot succeed because <see cref="SequentialQueue{T}.MarkAsComplete"/> was called.
 /// </summary>
 public sealed class SequentialQueueCompletedException : InvalidOperationException
 {
@@ -29,7 +31,7 @@ public interface ISequentialQueue<T> where T : class
     ValueTask<SequencedItem<T>> DequeueAsync(CancellationToken cancellationToken = default);
     bool TryDequeue(out SequencedItem<T> item);
 
-    void CompleteAdding();
+    void MarkAsComplete();
 
     IAsyncEnumerable<SequencedItem<T>> ReadAllAsync(CancellationToken cancellationToken = default);
 }
@@ -111,6 +113,7 @@ public sealed class SequentialQueue<T> :
         {
             throw new InvalidOperationException($"Failed to dequeue item with sequence number {nextSequence}.");
         }
+
         return await ValueTask.FromResult(item);
     }
 
@@ -128,7 +131,7 @@ public sealed class SequentialQueue<T> :
         return false;
     }
 
-    public void CompleteAdding()
+    public void MarkAsComplete()
     {
         ObjectDisposedException.ThrowIf(disposedValue, this);
         completed = true;
