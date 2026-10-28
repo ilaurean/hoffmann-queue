@@ -34,6 +34,7 @@ public class CancellationTests
     {
         using var queue = new SequentialQueue<string>(16);
         using var cts = new CancellationTokenSource(1);
+        await cts.CancelAsync(); // flaky when using timer, so cancel immediately
         var act = async () => { await foreach (var _ in queue.ReadAllAsync(cts.Token)) { } };
         await act.Should().ThrowAsync<OperationCanceledException>();
     }
