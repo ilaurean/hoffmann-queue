@@ -12,7 +12,10 @@ public readonly record struct SequencedItem<T>(long SequenceNumber, T Item);
 /// </summary>
 public sealed class SequentialQueueCompletedException : InvalidOperationException
 {
-    public SequentialQueueCompletedException() : base("The sequential queue has been completed.") { }
+    public SequentialQueueCompletedException()
+        : base("The sequential queue has been completed.")
+    {
+    }
 }
 
 public interface ISequentialQueue<T> where T : class
@@ -36,13 +39,15 @@ public interface ISequentialQueue<T> where T : class
 public sealed class SequentialQueue<T> :
     IDisposable, ISequentialQueue<T> where T : class
 {
+    private readonly Lock lockObject = new();
     private readonly int capacity;
     private long nextSequence;
     private bool completed = false;
 
-    private readonly Lock lockObject = new();
-
     private readonly Dictionary<long, T> items = [];
+
+    private readonly List<(long SequenceNumber, TaskCompletionSource Signal)> enqueueWaiters = [];
+    private readonly List<TaskCompletionSource> dequeueWaiters = [];
 
     public int Capacity => capacity;
 
@@ -61,19 +66,44 @@ public sealed class SequentialQueue<T> :
         nextSequence = firstSequenceNumber;
     }
 
+    #region Enqueue
+    /// <summary>
+    /// Enqueues the item, waiting while the sequence number is beyond the capacity window.
+    /// A producer that holds back an earlier sequence number while waiting for a far-ahead one can deadlock itself.
+    /// </summary>
     public async ValueTask EnqueueAsync(long sequenceNumber, T item, CancellationToken cancellationToken = default)
     {
         ValidateSequenceItem(sequenceNumber, item);
-        cancellationToken.ThrowIfCancellationRequested();
 
-        lock (lockObject)
+        while (true)
         {
-            if (!TryEnqueue(sequenceNumber, item))
+            cancellationToken.ThrowIfCancellationRequested();
+
+            TaskCompletionSource signal;
+            lock (lockObject)
             {
-                throw new InvalidOperationException($"Failed to enqueue item with sequence number {sequenceNumber}.");
+                if (TryEnqueueCore(sequenceNumber, item))
+                {
+                    SignalWaiters();
+                    return;
+                }
+
+                signal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                enqueueWaiters.Add((sequenceNumber, signal));
+            }
+
+            try
+            {
+                await signal.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                lock (lockObject)
+                {
+                    enqueueWaiters.RemoveAll(w => w.Signal == signal);
+                }
             }
         }
-        await ValueTask.CompletedTask;
     }
 
     public bool TryEnqueue(long sequenceNumber, T item)
@@ -82,12 +112,22 @@ public sealed class SequentialQueue<T> :
 
         lock (lockObject)
         {
-            ObjectDisposedException.ThrowIf(disposedValue, this);
+            var added = TryEnqueueCore(sequenceNumber, item);
+            if (added)
+            {
+                SignalWaiters();
+            }
+            return added;
         }
+    }
 
+    private bool TryEnqueueCore(long sequenceNumber, T item)
+    {
         lock (lockObject)
         {
-            if (IsCompleted)
+            ObjectDisposedException.ThrowIf(disposedValue, this);
+
+            if (completed)
             {
                 throw new SequentialQueueCompletedException();
             }
@@ -100,7 +140,7 @@ public sealed class SequentialQueue<T> :
                     $"Sequence number {sequenceNumber} is/was already in the queue. Next expected sequence number is {nextSequence}.");
             }
 
-            if (sequenceNumber >= nextSequence + capacity)
+            if (!IsSequenceNumberInWindow(sequenceNumber))
             {
                 return false;
             }
@@ -112,18 +152,47 @@ public sealed class SequentialQueue<T> :
             return true;
         }
     }
+    #endregion
 
+    #region Dequeue
+    /// <summary>
+    /// Dequeues the next item in sequence, waiting until it is available.
+    /// Throws <see cref="SequentialQueueCompletedException"/> once the queue is completed and the next item is missing.
+    /// </summary>
     public async ValueTask<SequencedItem<T>> DequeueAsync(CancellationToken cancellationToken = default)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        lock (lockObject)
+        while (true)
         {
-            if (!TryDequeue(out var item))
+            cancellationToken.ThrowIfCancellationRequested();
+
+            TaskCompletionSource signal;
+            lock (lockObject)
             {
-                throw new InvalidOperationException($"Failed to dequeue item with sequence number {nextSequence}.");
+                if (TryDequeue(out var item))
+                {
+                    return item;
+                }
+
+                if (completed)
+                {
+                    throw new SequentialQueueCompletedException();
+                }
+
+                signal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                dequeueWaiters.Add(signal);
             }
-            return item;
+
+            try
+            {
+                await signal.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                lock (lockObject)
+                {
+                    dequeueWaiters.Remove(signal);
+                }
+            }
         }
     }
 
@@ -137,12 +206,14 @@ public sealed class SequentialQueue<T> :
             if (items.Remove(nextSequence, out var value))
             {
                 item = new SequencedItem<T>(nextSequence++, value);
+                SignalWaiters();
                 return true;
             }
 
             return false;
         }
     }
+    #endregion
 
     public void MarkAsComplete()
     {
@@ -150,6 +221,7 @@ public sealed class SequentialQueue<T> :
         {
             ObjectDisposedException.ThrowIf(disposedValue, this);
             completed = true;
+            SignalWaiters();
         }
     }
 
@@ -162,7 +234,7 @@ public sealed class SequentialQueue<T> :
             {
                 item = await DequeueAsync(cancellationToken);
             }
-            catch (InvalidOperationException)
+            catch (SequentialQueueCompletedException)
             {
                 yield break;
             }
@@ -174,6 +246,40 @@ public sealed class SequentialQueue<T> :
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(sequenceNumber, 1L);
         ArgumentNullException.ThrowIfNull(item);
+    }
+
+
+    // Must be called while holding lockObject.
+    private void SignalWaiters()
+    {
+        var finished = completed || disposedValue;
+
+        if (finished || items.ContainsKey(nextSequence))
+        {
+            foreach (var waiter in dequeueWaiters)
+            {
+                waiter.TrySetResult();
+            }
+            dequeueWaiters.Clear();
+        }
+
+        enqueueWaiters.RemoveAll(w =>
+        {
+            if (finished || IsSequenceNumberInWindow(w.SequenceNumber))
+            {
+                w.Signal.TrySetResult();
+                return true;
+            }
+            return false;
+        });
+    }
+
+    private bool IsSequenceNumberInWindow(long sequenceNumber)
+    {
+        lock (lockObject)
+        {
+            return sequenceNumber < nextSequence + capacity;
+        }
     }
 
     #region IDisposable
@@ -193,6 +299,7 @@ public sealed class SequentialQueue<T> :
                 // TODO: free unmanaged resources (unmanaged objects) and override finalizer
                 // TODO: set large fields to null
                 disposedValue = true;
+                SignalWaiters();
             }
         }
     }
