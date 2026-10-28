@@ -90,7 +90,7 @@ public class CapacityTests
     }
 
     [Fact]
-    public void Should_Throw_When_EnqueueAndMarkedCompleted()
+    public async Task Should_Throw_When_EnqueueAndMarkedCompleted()
     {
         using var queue = new SequentialQueue<string>(16);
         queue.TryEnqueue(1, Item(1)).Should().BeTrue();
@@ -98,6 +98,8 @@ public class CapacityTests
         queue.TryEnqueue(3, Item(3)).Should().BeTrue();
         queue.MarkAsComplete();
         queue.IsCompleted.Should().BeTrue();
-        queue.Invoking(x => x.TryEnqueue(5, Item(5))).Should().Throw<SequentialQueueCompletedException>();
+        queue.Invoking(q => q.TryEnqueue(4, "x")).Should().Throw<SequentialQueueCompletedException>();
+        await queue.Invoking(q => q.EnqueueAsync(1, "x").AsTask()).Should().ThrowAsync<SequentialQueueCompletedException>();
+
     }
 }
