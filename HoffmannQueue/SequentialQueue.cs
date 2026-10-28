@@ -12,10 +12,7 @@ public readonly record struct SequencedItem<T>(long SequenceNumber, T Item);
 /// </summary>
 public sealed class SequentialQueueCompletedException : InvalidOperationException
 {
-    public SequentialQueueCompletedException()
-        : base("The sequential queue has been completed.")
-    {
-    }
+    public SequentialQueueCompletedException() : base("The sequential queue has been completed.") { }
 }
 
 public interface ISequentialQueue<T> where T : class
@@ -43,15 +40,17 @@ public sealed class SequentialQueue<T> :
     private long nextSequence;
     private bool completed = false;
 
+    private readonly Lock lockObject = new();
+
     private readonly Dictionary<long, T> items = [];
 
     public int Capacity => capacity;
 
-    public int Count => items.Count;
+    public int Count { get { lock (lockObject) { return items.Count; } } }
 
-    public bool IsCompleted => completed && items.ContainsKey(nextSequence);
+    public bool IsCompleted { get { lock (lockObject) { return completed; } } }
 
-    public long NextSequenceNumber => nextSequence;
+    public long NextSequenceNumber { get { lock (lockObject) { return nextSequence; } } }
 
     public SequentialQueue(int capacity, long firstSequenceNumber = 1)
     {
@@ -67,74 +66,95 @@ public sealed class SequentialQueue<T> :
         ValidateSequenceItem(sequenceNumber, item);
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (!TryEnqueue(sequenceNumber, item))
+        lock (lockObject)
         {
-            throw new InvalidOperationException($"Failed to enqueue item with sequence number {sequenceNumber}.");
+            if (!TryEnqueue(sequenceNumber, item))
+            {
+                throw new InvalidOperationException($"Failed to enqueue item with sequence number {sequenceNumber}.");
+            }
         }
-
         await ValueTask.CompletedTask;
     }
 
     public bool TryEnqueue(long sequenceNumber, T item)
     {
-        ObjectDisposedException.ThrowIf(disposedValue, this);
         ValidateSequenceItem(sequenceNumber, item);
 
-        if (IsCompleted)
+        lock (lockObject)
         {
-            throw new SequentialQueueCompletedException();
+            ObjectDisposedException.ThrowIf(disposedValue, this);
         }
 
-        if (sequenceNumber < nextSequence || items.ContainsKey(sequenceNumber))
+        lock (lockObject)
         {
-            throw new ArgumentOutOfRangeException(
-                nameof(sequenceNumber),
-                sequenceNumber,
-                $"Sequence number {sequenceNumber} is/was already in the queue. Next expected sequence number is {nextSequence}.");
-        }
+            if (IsCompleted)
+            {
+                throw new SequentialQueueCompletedException();
+            }
 
-        if (sequenceNumber >= nextSequence + capacity)
-        {
-            return false;
-        }
+            if (sequenceNumber < nextSequence || items.ContainsKey(sequenceNumber))
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(sequenceNumber),
+                    sequenceNumber,
+                    $"Sequence number {sequenceNumber} is/was already in the queue. Next expected sequence number is {nextSequence}.");
+            }
 
-        if (!items.TryAdd(sequenceNumber, item))
-        {
-            throw new InvalidOperationException($"Failed to add item with sequence number {sequenceNumber} to the queue.");
+            if (sequenceNumber >= nextSequence + capacity)
+            {
+                return false;
+            }
+
+            if (!items.TryAdd(sequenceNumber, item))
+            {
+                throw new InvalidOperationException($"Failed to add item with sequence number {sequenceNumber} to the queue.");
+            }
+            return true;
         }
-        return true;
     }
 
     public async ValueTask<SequencedItem<T>> DequeueAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (!TryDequeue(out var item))
+        lock (lockObject)
         {
-            throw new InvalidOperationException($"Failed to dequeue item with sequence number {nextSequence}.");
+            if (!TryDequeue(out var item))
+            {
+                throw new InvalidOperationException($"Failed to dequeue item with sequence number {nextSequence}.");
+            }
+            return item;
         }
-
-        return await ValueTask.FromResult(item);
     }
 
     public bool TryDequeue(out SequencedItem<T> item)
     {
-        item = default;
-        ObjectDisposedException.ThrowIf(disposedValue, this);
-
-        if (items.Remove(nextSequence, out var value))
+        lock (lockObject)
         {
-            item = new SequencedItem<T>(nextSequence++, value);
-            return true;
+            ObjectDisposedException.ThrowIf(disposedValue, this);
         }
 
-        return false;
+        lock (lockObject)
+        {
+            item = default;
+
+            if (items.Remove(nextSequence, out var value))
+            {
+                item = new SequencedItem<T>(nextSequence++, value);
+                return true;
+            }
+
+            return false;
+        }
     }
 
     public void MarkAsComplete()
     {
-        ObjectDisposedException.ThrowIf(disposedValue, this);
-        completed = true;
+        lock (lockObject)
+        {
+            ObjectDisposedException.ThrowIf(disposedValue, this);
+            completed = true;
+        }
     }
 
     public async IAsyncEnumerable<SequencedItem<T>> ReadAllAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -165,16 +185,19 @@ public sealed class SequentialQueue<T> :
 
     private void Dispose(bool disposing)
     {
-        if (!disposedValue)
+        lock (lockObject)
         {
-            if (disposing)
+            if (!disposedValue)
             {
-                items.Clear();
-            }
+                if (disposing)
+                {
+                    items.Clear();
+                }
 
-            // TODO: free unmanaged resources (unmanaged objects) and override finalizer
-            // TODO: set large fields to null
-            disposedValue = true;
+                // TODO: free unmanaged resources (unmanaged objects) and override finalizer
+                // TODO: set large fields to null
+                disposedValue = true;
+            }
         }
     }
 
