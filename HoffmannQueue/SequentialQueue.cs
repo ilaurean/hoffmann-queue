@@ -39,6 +39,14 @@ public interface ISequentialQueue<T> where T : class
 public sealed class SequentialQueue<T> :
     IDisposable, ISequentialQueue<T> where T : class
 {
+    private sealed class DequeueWaiter
+    {
+        public TaskCompletionSource<SequencedItem<T>> Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public LinkedListNode<DequeueWaiter>? Node { get; set; }
+    }
+
     private readonly Lock lockObject = new();
     private readonly int capacity;
     private long nextSequence;
@@ -47,7 +55,7 @@ public sealed class SequentialQueue<T> :
     private readonly Dictionary<long, T> items = [];
 
     private readonly List<(long SequenceNumber, TaskCompletionSource Signal)> enqueueWaiters = [];
-    private readonly List<TaskCompletionSource> dequeueWaiters = [];
+    private readonly LinkedList<DequeueWaiter> dequeueWaiters = [];
 
     public int Capacity => capacity;
 
@@ -161,38 +169,52 @@ public sealed class SequentialQueue<T> :
     /// </summary>
     public async ValueTask<SequencedItem<T>> DequeueAsync(CancellationToken cancellationToken = default)
     {
-        while (true)
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var waiter = new DequeueWaiter();
+        using var cancellationRegistration = cancellationToken.Register(
+            static state =>
+            {
+                var (queue, pendingWaiter, token) =
+                    ((SequentialQueue<T>, DequeueWaiter, CancellationToken))state!;
+                queue.CancelDequeueWaiter(pendingWaiter, token);
+            },
+            (this, waiter, cancellationToken));
+
+        lock (lockObject)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            ObjectDisposedException.ThrowIf(disposedValue, this);
+            SignalWaiters();
 
-            TaskCompletionSource signal;
-            lock (lockObject)
+            if (dequeueWaiters.Count == 0 && TryDequeueCore(out var item))
             {
-                if (TryDequeue(out var item))
-                {
-                    return item;
-                }
-
-                if (completed)
-                {
-                    throw new SequentialQueueCompletedException();
-                }
-
-                signal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                dequeueWaiters.Add(signal);
+                SignalWaiters();
+                return item;
             }
 
-            try
+            if (completed)
             {
-                await signal.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                throw new SequentialQueueCompletedException();
             }
-            finally
+
+            waiter.Node = dequeueWaiters.AddLast(waiter);
+        }
+
+        return await waiter.Completion.Task.ConfigureAwait(false);
+    }
+
+    private void CancelDequeueWaiter(DequeueWaiter waiter, CancellationToken cancellationToken)
+    {
+        lock (lockObject)
+        {
+            if (waiter.Node?.List == dequeueWaiters)
             {
-                lock (lockObject)
-                {
-                    dequeueWaiters.Remove(signal);
-                }
+                dequeueWaiters.Remove(waiter.Node);
+                waiter.Node = null;
             }
+
+            waiter.Completion.TrySetCanceled(cancellationToken);
         }
     }
 
@@ -203,15 +225,26 @@ public sealed class SequentialQueue<T> :
             ObjectDisposedException.ThrowIf(disposedValue, this);
 
             item = default;
-            if (items.Remove(nextSequence, out var value))
+            if (TryDequeueCore(out item))
             {
-                item = new SequencedItem<T>(nextSequence++, value);
                 SignalWaiters();
                 return true;
             }
 
             return false;
         }
+    }
+
+    private bool TryDequeueCore(out SequencedItem<T> item)
+    {
+        item = default;
+        if (!items.Remove(nextSequence, out var value))
+        {
+            return false;
+        }
+
+        item = new SequencedItem<T>(nextSequence++, value);
+        return true;
     }
     #endregion
 
@@ -252,16 +285,36 @@ public sealed class SequentialQueue<T> :
     // Must be called while holding lockObject.
     private void SignalWaiters()
     {
-        var finished = completed || disposedValue;
-
-        if (finished || items.ContainsKey(nextSequence))
+        if (disposedValue)
         {
-            foreach (var waiter in dequeueWaiters)
+            while (dequeueWaiters.First is { } disposedNode)
             {
-                waiter.TrySetResult();
+                dequeueWaiters.RemoveFirst();
+                disposedNode.Value.Node = null;
+                disposedNode.Value.Completion.TrySetException(new ObjectDisposedException(GetType().Name));
             }
-            dequeueWaiters.Clear();
         }
+        else
+        {
+            while (dequeueWaiters.First is { } node && TryDequeueCore(out var item))
+            {
+                dequeueWaiters.RemoveFirst();
+                node.Value.Node = null;
+                node.Value.Completion.TrySetResult(item);
+            }
+
+            if (completed)
+            {
+                while (dequeueWaiters.First is { } completedNode)
+                {
+                    dequeueWaiters.RemoveFirst();
+                    completedNode.Value.Node = null;
+                    completedNode.Value.Completion.TrySetException(new SequentialQueueCompletedException());
+                }
+            }
+        }
+
+        var finished = completed || disposedValue;
 
         enqueueWaiters.RemoveAll(w =>
         {

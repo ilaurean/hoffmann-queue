@@ -59,6 +59,21 @@ public class WaiterTests
     }
 
     [Fact]
+    public async Task Should_Succeed_When_CancelledConsumerIsRemovedFromWaiterOrder()
+    {
+        using var queue = new SequentialQueue<string>(10);
+        using var cancellation = new CancellationTokenSource();
+        var first = queue.DequeueAsync(cancellation.Token).AsTask();
+        var second = queue.DequeueAsync(TestContext.Current.CancellationToken).AsTask();
+
+        await cancellation.CancelAsync();
+        await first.Invoking(task => task).Should().ThrowAsync<OperationCanceledException>();
+
+        queue.TryEnqueue(1, Item(1)).Should().BeTrue();
+        (await second.WithTimeout()).SequenceNumber.Should().Be(1);
+    }
+
+    [Fact]
     public async Task Should_Succeed_When_WindowAdvancesWhileEnqueueing()
     {
         using var queue = new SequentialQueue<string>(2);
